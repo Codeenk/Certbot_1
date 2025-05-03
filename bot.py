@@ -1,9 +1,12 @@
 import os
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import google.generativeai as genai
 import logging
+import markdown2
+import re
 
 # Set up logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -23,52 +26,86 @@ genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 model = genai.GenerativeModel('gemini-2.0-flash')
 
 # Conversation states
-TOPIC, LEARNING, ASSESSMENT, CERTIFICATION, FINAL_PROJECT = range(5)
+TOPIC, LEARNING, ASSESSMENT, CERTIFICATION = range(4)
 
 # User session storage
 user_data = {}
+
+def format_response(text):
+    # Clean any existing HTML tags first
+    text = re.sub(r'<[^>]+>', '', text)
+    
+    # Format code blocks with Telegram-compatible tags
+    text = re.sub(r'```(\w+)?\n(.*?)\n```', r'<pre><code>\2</code></pre>', text, flags=re.DOTALL)
+    
+    # Convert markdown to plain text formatting
+    text = re.sub(r'#+ +(.*?)(?:\n|$)', r'\1\n', text)
+    text = re.sub(r'^\s*[*-] +(.*)$', r'• \1', text, flags=re.MULTILINE)
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    
+    # Clean up video links
+    text = re.sub(r'Link:\s*(https?://[^\s]+)', r'🔗 \1', text)
+    
+    # Ensure proper spacing
+    text = text.replace('\n\n', '\n')  # Remove extra newlines
+    text = text.replace('</code></pre>', '</code></pre>\n')  # Add newline after code blocks
+    
+    return text
 
 class CourseModule:
     def __init__(self, topic):
         self.topic = topic
         self.current_module = 1
-        self.completed_modules = {}  # Stores module number: passed status
+        self.completed_modules = {}
+        self.module_content = {}
         self.modules = self._generate_modules()
+        
+    def get_module_video_link(self, module_number):
+        if module_number in self.module_content:
+            content = self.module_content[module_number]
+            # Extract video link using regex
+            video_match = re.search(r'🔗\s*(https?://[^\s]+)', content)
+            if video_match:
+                return video_match.group(1)
+        return None
+    
+    def _store_module_content(self, module_number, content):
+        self.module_content[module_number] = content
         
     def _generate_modules(self):
         try:
             prompt = f"""Generate a structured learning path for {self.topic} with 5 modules.
-For each module, format the output as follows:
-📚 Module [NUMBER]: [NAME]
-━━━━━━━━━━━━━━━━━━━━━━━━━
-📝 Description:
-[Clear and concise description]
+            For each module provide:
+            1. A clear title
+            2. A very short description of what will be learned
+            3. One specific YouTube video link from a reputable educational channel
+            4. design the course such that it gets fully completed and makes the user master in that course.
+            
+            Format as follows:
 
-🎯 Key Topics:
-• [Topic 1]
-• [Topic 2]
-• [Topic 3]
+            📚 Module 1: [NAME]
+            
+            📝 Description:
+            [2-3 sentences about what will be learned]
+           
+            🎬 Educational Video:
+            • Title: [specific video title]
+              Link: https://youtube.com/... (use real educational video links)
+              Duration: [approximate duration]
 
-🎬 Recommended Resources:
-• Title: [specific video title]
-  Link: [actual YouTube educational video link]
-  Duration: [approximate duration]
-
-Use proper spacing and emoji to make it visually appealing and easy to read.
-Keep descriptions practical and beginner-friendly.
-For Python specifically, include actual links to well-known educational channels like:
-- Corey Schafer
-- Tech With Tim
-- freeCodeCamp
-- Programming with Mosh
-
-Format everything in markdown for better readability in Telegram.
-Keep the total response under 4000 characters."""
+            [Repeat for all 5 modules]"""
 
             response = model.generate_content(prompt)
-            formatted_response = response.text.replace('[', '').replace(']', '')  # Remove square brackets
             
-            # Check if response is too long for Telegram
+            # Extract and store individual module content
+            modules_content = re.split(r'📚\s*Module\s+\d+:', response.text)
+            if len(modules_content) > 1:
+                modules_content = modules_content[1:]  # Skip first empty split
+                for i, content in enumerate(modules_content, 1):
+                    self._store_module_content(i, content.strip())
+            
+            formatted_response = format_response(response.text)
             if len(formatted_response) > 4000:
                 formatted_response = formatted_response[:3997] + "..."
                 
@@ -95,13 +132,14 @@ async def set_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(modules) > 4000:
         chunks = [modules[i:i+4000] for i in range(0, len(modules), 4000)]
         for chunk in chunks:
-            await update.message.reply_text(chunk)
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
     else:
         await update.message.reply_text(
             f"Great choice! Here's your learning path for {topic}:\n\n"
             f"{modules}\n\n"
             "When you complete a module, type 'completed module X'\n"
-            "For example: 'completed module 1'"
+            "For example: 'completed module 1'",
+            parse_mode=ParseMode.HTML
         )
     return LEARNING
 
@@ -109,8 +147,74 @@ async def handle_learning(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     message_text = update.message.text.lower()
     
+    # Check if this is a course completion request
+    if message_text == 'course completed':
+        if len(user_data[user_id].completed_modules) == 5:  # All modules must be completed
+            return await handle_certification(update, context)
+        else:
+            await update.message.reply_text(
+                "⚠️ You need to complete all 5 modules before you can get the course completion certificate.\n"
+                f"You have completed {len(user_data[user_id].completed_modules)} out of 5 modules."
+            )
+            return LEARNING
+            
+    # Check if user is providing a video link
+    if 'video_pending' in context.user_data:
+        if message_text.startswith('http'):
+            module_num = context.user_data['video_pending']
+            user_data[user_id].module_content[module_num] = user_data[user_id].module_content[module_num].replace(
+                'Link: https://youtube.com/...', 
+                f'Link: {message_text}'
+            )
+            del context.user_data['video_pending']
+            
+            # Now proceed with the assessment
+            context.user_data['current_module'] = module_num
+            module_content = user_data[user_id].module_content.get(module_num, "")
+            
+            # Extract description to understand the topics
+            desc_match = re.search(r'📝 Description:(.*?)(?=\n\n|$)', module_content, re.DOTALL)
+            description = desc_match.group(1).strip() if desc_match else ""
+            
+            # Generate question based on the module topics
+            prompt = f"""Generate a conceptual question for Module {module_num} of {user_data[user_id].topic}.
+
+            Module Description:
+            {description}
+
+            The user has watched a video about these concepts. Generate a question that:
+            1. Tests understanding of the core concepts covered in this module
+            2. Requires critical thinking and application of knowledge
+            3. Is NOT specific to the video content, but rather about the general concepts
+            4. Encourages problem-solving and creative thinking
+            5. Could be answered by anyone who understands these concepts well
+
+            Format: Create a clear, challenging question that tests conceptual understanding rather than specific video details."""
+            
+            try:
+                question = model.generate_content(prompt)
+                context.user_data['current_question'] = question.text
+                
+                await update.message.reply_text(
+                    f"📝 Conceptual Assessment for Module {module_num}:\n\n"
+                    f"{question.text}\n\n"
+                    "Please provide your answer in detail, showing your understanding of the concepts."
+                )
+                return ASSESSMENT
+            except Exception as e:
+                logger.error(f"Error generating question: {str(e)}")
+                await update.message.reply_text(
+                    "Sorry, I had trouble generating a question. Please try again."
+                )
+                return LEARNING
+        else:
+            await update.message.reply_text(
+                "Please provide a valid YouTube video link that you watched for this module.\n"
+                "The link should start with 'http' or 'https'."
+            )
+            return LEARNING
+    
     # Check if the message matches "completed module X" pattern
-    import re
     module_match = re.match(r'completed module (\d+)', message_text)
     
     if module_match:
@@ -121,24 +225,25 @@ async def handle_learning(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Please complete the modules in order. You are currently on Module {user_data[user_id].current_module}."
                 )
                 return LEARNING
-                
-            # Store the current module number for assessment
-            context.user_data['current_module'] = completed_module
             
-            prompt = f"""Generate a challenging question for Module {completed_module} of {user_data[user_id].topic}.
-            Focus on the key concepts covered in this specific module.
-            Make the question specific and practical.
-            Don't provide the answer."""
+            # Add reminder about course completion if this is the last module
+            if completed_module == 5:
+                context.user_data['final_module'] = True
             
-            question = model.generate_content(prompt)
-            context.user_data['current_question'] = question.text
+            # Ask for the video link first
+            context.user_data['video_pending'] = completed_module
             
-            await update.message.reply_text(
-                f"📝 Assessment for Module {completed_module}:\n\n"
-                f"{question.text}\n\n"
-                "Please provide your answer in detail."
-            )
-            return ASSESSMENT
+            message = f"Great! Before we proceed with the assessment for Module {completed_module}, "\
+                     "please share the YouTube video link that you watched for this module.\n\n"\
+                     "This helps me generate questions specific to the content you learned."
+            
+            # Add reminder about course completion option for the last module
+            if context.user_data.get('final_module'):
+                message += "\n\nℹ️ After completing this final module, you can type 'course completed' "\
+                          "to get your Course Completion Certificate with a project assessment!"
+            
+            await update.message.reply_text(message)
+            return LEARNING
         else:
             await update.message.reply_text(
                 "Invalid module number. Please specify a module between 1 and 5.\n"
@@ -220,7 +325,7 @@ async def assess_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_certification_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     message = update.message.text.lower()
-    certification_form = "https://forms.gle/h1PimKbwbafAGux28"
+    regular_certification_form = "https://forms.gle/h1PimKbwbafAGux28"
     
     if message == 'certify all':
         completed_modules = sorted(user_data[user_id].completed_modules.keys())
@@ -235,12 +340,11 @@ async def handle_certification_request(update: Update, context: ContextTypes.DEF
                 f"💰 Original cost: ₹{99 * module_count}\n"
                 f"💳 Your price: ₹{total_cost}\n"
                 f"🎯 Your savings: ₹{(99 * module_count) - total_cost}!\n\n"
-                f"📝 Certification Form: {certification_form}\n\n"
+                f"📝 Certification Form: {regular_certification_form}\n\n"
                 "Type 'continue' when you're ready to proceed!"
             )
     else:
         # Handle individual module certification
-        import re
         module_match = re.match(r'certify (\d+)', message)
         if module_match:
             module_num = int(module_match.group(1))
@@ -248,7 +352,7 @@ async def handle_certification_request(update: Update, context: ContextTypes.DEF
                 await update.message.reply_text(
                     f"🎉 Get certified for Module {module_num}!\n\n"
                     f"💳 Cost: ₹99\n"
-                    f"📝 Certification Form: {certification_form}\n\n"
+                    f"📝 Certification Form: {regular_certification_form}\n\n"
                     "Type 'continue' when you're ready to proceed!"
                 )
             else:
@@ -262,9 +366,10 @@ async def handle_certification_request(update: Update, context: ContextTypes.DEF
 async def handle_certification(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     choice = update.message.text.lower()
+    regular_certification_form = "https://forms.gle/h1PimKbwbafAGux28"
+    course_completion_form = "https://forms.gle/2vwrpeRL39F5rS4j8"
     
     if choice == 'continue':
-        # No need to calculate next_module, we already updated it in assess_answer
         next_module = user_data[user_id].current_module
         if next_module <= 5:
             await update.message.reply_text(
@@ -274,153 +379,139 @@ async def handle_certification(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return LEARNING
         else:
-            # All modules completed - offer final project
+            # All modules completed - show all certification options
             completed_modules = sorted(user_data[user_id].completed_modules.keys())
+            await update.message.reply_text(
+                "🎓 Congratulations! You've completed all modules!\n\n"
+                f"Modules completed: {', '.join(map(str, completed_modules))}\n\n"
+                "You have these certification options:\n"
+                "1. Get certified for individual modules (type 'certify X')\n"
+                "2. Get certified for all modules (type 'certify all')\n"
+                "3. Get Course Completion Certificate with project (type 'course completed')\n\n"
+                "💡 The Course Completion Certificate includes a project assessment.\n"
+                "You'll need to complete a project and submit it via GitHub."
+            )
+            return CERTIFICATION
+    elif choice == 'course completed':
+        if len(user_data[user_id].completed_modules) == 5:  # All modules must be completed
             topic = user_data[user_id].topic
             
-            prompt = f"""Generate a mini-project problem for someone who has completed a full course in {topic}.
-            The project should:
-            1. Incorporate concepts from all modules
-            2. Be completable in a single code file
-            3. Be challenging but doable
-            4. Have clear requirements and deliverables
-            5. Include sample input/output examples
+            prompt = f"""Generate a concise but challenging project problem for {topic}.
+            Keep the total response under 3000 characters.
             
-            Format the response as:
-            🎯 FINAL PROJECT CHALLENGE
+            The project should test practical implementation while being concise:
+            1. Core functionality that demonstrates mastery
+            2. Clear but brief requirements
+            3. Essential test cases only
+            4. Focus on key concepts learned
+
+            Format (be brief but clear):
+            🎯 PROJECT: [Short title]
             
-            📋 Project Title:
-            [Title]
+            📋 Goal: [One sentence objective]
             
-            🎯 Objective:
-            [Clear 1-2 sentence objective]
+            📝 Must Have:
+            • [Core requirement]
+            • [Core requirement]
+            • [Core requirement]
             
-            📝 Requirements:
-            • [Requirement 1]
-            • [Requirement 2]
-            • ...
+            💡 Example:
+            [One clear input/output example]
             
-            ⚡ Key Features to Implement:
-            • [Feature 1]
-            • [Feature 2]
-            • ...
+            ⭐ Success Criteria:
+            • Working implementation
+            • Clean code
+            • Good documentation
+            • Error handling
             
-            📊 Sample Input/Output:
-            [Clear examples]
-            
-            📌 Important Notes:
-            • All code must be in a single file
-            • Include comments explaining your code
-            • Follow best practices
-            
-            ⏳ When ready, send your completed code file.
-            Type 'submit project' to submit your solution."""
+            📋 Submit:
+            1. Upload completed project to GitHub
+            2. Type 'done' for the submission form"""
             
             try:
                 project = model.generate_content(prompt)
-                context.user_data['final_project'] = project.text
+                project_text = project.text
                 
+                # Ensure the message with formatting stays under 4096 characters
+                guidelines = """
+When you've completed the project:
+1. Upload it to GitHub with:
+   • Clear README.md
+   • Setup instructions
+   • Sample usage
+2. Type 'done' to get the submission form link"""
+
+                total_message = f"🎯 Here's your Course Completion Project:\n\n{project_text}\n\n{guidelines}"
+                
+                if len(total_message) > 4000:
+                    # Truncate the project text if needed
+                    max_project_length = 3800 - len(guidelines)
+                    project_text = project_text[:max_project_length] + "..."
+                    total_message = f"🎯 Here's your Course Completion Project:\n\n{project_text}\n\n{guidelines}"
+                
+                context.user_data['project_assigned'] = True
                 await update.message.reply_text(
-                    "🎓 Congratulations! You've completed all modules!\n\n"
-                    f"Modules completed: {', '.join(map(str, completed_modules))}\n\n"
-                    "You have two options:\n"
-                    "1. Get certified now (type 'certify all')\n"
-                    "2. Take on the final project challenge (type 'start project')\n\n"
-                    "💡 Completing the final project will give you an advanced certification!"
+                    total_message,
+                    parse_mode=ParseMode.HTML
                 )
+                return CERTIFICATION
             except Exception as e:
-                logger.error(f"Error generating final project: {str(e)}")
+                logger.error(f"Error generating project: {str(e)}")
                 await update.message.reply_text(
-                    "🎓 Congratulations! You've completed all modules!\n"
-                    "You can get certified in individual modules or all modules together.\n"
-                    "Type 'certify X' for specific module X, or 'certify all' for all modules."
+                    "Sorry, I had trouble generating the project. Please try again by typing 'course completed'"
                 )
-            return CERTIFICATION
-    elif choice == 'start project':
-        if 'final_project' in context.user_data:
+                return CERTIFICATION
+        else:
             await update.message.reply_text(
-                f"{context.user_data['final_project']}"
+                "⚠️ You need to complete all 5 modules before you can get the course completion project.\n"
+                f"You have completed {len(user_data[user_id].completed_modules)} out of 5 modules."
             )
-            return FINAL_PROJECT
+            return CERTIFICATION
+    elif choice == 'done':
+        if context.user_data.get('project_assigned'):
+            await update.message.reply_text(
+                "🎉 Great! You're ready to submit your project.\n\n"
+                "Please fill out this form to get your Course Completion Certificate:\n"
+                f"📝 {course_completion_form}\n\n"
+                "The form will ask for:\n"
+                "• Your course topic\n"
+                "• Project description\n"
+                "• GitHub repository link\n"
+                "• Any additional notes\n\n"
+                "Your certificate will be issued after we review your submission!"
+            )
+            return CERTIFICATION
+        else:
+            await update.message.reply_text(
+                "⚠️ Please get your project requirements first by typing 'course completed'"
+            )
+            return CERTIFICATION
     elif choice.startswith('certify'):
         return await handle_certification_request(update, context)
     
     return LEARNING
 
-async def handle_final_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    message = update.message.text.lower()
-    certification_form = "https://forms.gle/h1PimKbwbafAGux28"
-    
-    if message == 'submit project':
-        await update.message.reply_text(
-            "🎯 Great! Please send your code file for review.\n"
-            "Make sure:\n"
-            "• All code is in a single file\n"
-            "• Code is well-commented\n"
-            "• All requirements are implemented\n\n"
-            "Reply with your code file when ready."
-        )
-        return FINAL_PROJECT
-    elif update.message.document:
-        # User has sent a file
-        file = update.message.document
-        if not file.file_name.endswith(('.py', '.ipynb', '.js', '.java', '.cpp', '.c')):
-            await update.message.reply_text(
-                "❌ Please submit a valid code file (supported formats: .py, .ipynb, .js, .java, .cpp, .c)"
-            )
-            return FINAL_PROJECT
-            
-        prompt = f"""Review this project submission for {user_data[user_id].topic}.
-        Check if it meets all requirements from the project description.
-        Respond with PASS or FAIL followed by a brief explanation."""
-        
-        # Here you would normally download and process the file
-        # For now, we'll simulate a review
-        review = model.generate_content(prompt)
-        is_passed = review.text.upper().startswith('PASS')
-        
-        if is_passed:
-            await update.message.reply_text(
-                f"🎉 Congratulations! Your project has passed the review!\n\n"
-                f"{review.text}\n\n"
-                f"🏆 You've earned the Advanced Certification!\n"
-                f"💳 Cost for Advanced Certification (includes all modules): ₹299\n"
-                f"📝 Certification Form: {certification_form}\n\n"
-                "This certification validates both your theoretical knowledge and practical skills!"
-            )
-        else:
-            await update.message.reply_text(
-                f"📝 Project Review Result:\n\n"
-                f"{review.text}\n\n"
-                "You can:\n"
-                "1. Submit a revised version (send new file)\n"
-                "2. Get regular certification instead (type 'certify all')\n"
-                "3. Try again later (type 'exit')"
-            )
-        return FINAL_PROJECT
-    
-    return LEARNING
-
 def main():
+    # Create application
     application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
     
+    # Add conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
             TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_topic)],
             LEARNING: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_learning)],
             ASSESSMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, assess_answer)],
-            CERTIFICATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_certification)],
-            FINAL_PROJECT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_final_project),
-                MessageHandler(filters.Document.ALL, handle_final_project)
-            ]
+            CERTIFICATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_certification)]
         },
-        fallbacks=[]
+        fallbacks=[CommandHandler('cancel', lambda update, context: ConversationHandler.END)]
     )
     
+    # Add handler
     application.add_handler(conv_handler)
+    
+    # Start the bot
+    print("Starting bot...")
     application.run_polling()
 
 if __name__ == '__main__':
