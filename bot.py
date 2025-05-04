@@ -7,6 +7,10 @@ import google.generativeai as genai
 import logging
 import markdown2
 import re
+from flask import Flask, request
+
+# Set up Flask app
+app = Flask(__name__)
 
 # Set up logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -510,9 +514,23 @@ def main():
     # Add handler
     application.add_handler(conv_handler)
     
-    # Start the bot
-    print("Starting bot...")
-    application.run_polling()
+    # Set up webhook
+    port = int(os.getenv('PORT', 8080))
+    webhook_url = os.getenv('WEBHOOK_URL')
+    if webhook_url:
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            webhook_url=webhook_url
+        )
+    else:
+        # Fallback to polling (for local development)
+        application.run_polling()
+
+# Add Flask route for health check
+@app.route('/')
+def home():
+    return 'Bot is running!'
 
 if __name__ == '__main__':
     main()
