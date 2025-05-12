@@ -4,3 +4,4 @@ python-dotenv==1.0.1
 markdown2==2.4.12
 flask==3.0.2
 gunicorn==21.2.0
+aiohttp==3.9.3

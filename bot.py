@@ -7,10 +7,22 @@ import google.generativeai as genai
 import logging
 import markdown2
 import re
-from flask import Flask, request
+from flask import Flask
+from threading import Thread
 
-# Set up Flask app
-app = Flask(__name__)
+# Set up Flask app for keeping the bot alive
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 
 # Set up logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -28,6 +40,9 @@ if not os.getenv('GEMINI_API_KEY'):
 # Configure Gemini AI
 genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 model = genai.GenerativeModel('gemini-2.0-flash')
+
+# Create application instance at module level
+application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
 
 # Conversation states
 TOPIC, LEARNING, ASSESSMENT, CERTIFICATION = range(4)
@@ -496,9 +511,6 @@ When you've completed the project:
     return LEARNING
 
 def main():
-    # Create application
-    application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
-    
     # Add conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
@@ -514,23 +526,11 @@ def main():
     # Add handler
     application.add_handler(conv_handler)
     
-    # Set up webhook
-    port = int(os.getenv('PORT', 8080))
-    webhook_url = os.getenv('WEBHOOK_URL')
-    if webhook_url:
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            webhook_url=webhook_url
-        )
-    else:
-        # Fallback to polling (for local development)
-        application.run_polling()
-
-# Add Flask route for health check
-@app.route('/')
-def home():
-    return 'Bot is running!'
+    # Keep the bot alive on Replit
+    keep_alive()
+    
+    # Run the bot
+    application.run_polling()
 
 if __name__ == '__main__':
     main()

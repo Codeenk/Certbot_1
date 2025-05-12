@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "telegram-learning-bot"
+version = "0.1.0"
+description = "A Telegram bot for learning and certification"
+authors = ["Your Name"]
+
+[tool.poetry.dependencies]
+python = "^3.11.7"
+python-telegram-bot = "20.8"
+google-generativeai = "0.3.2"
+python-dotenv = "1.0.1"
+markdown2 = "2.4.12"
+flask = "3.0.2"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
